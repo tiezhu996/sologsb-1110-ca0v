@@ -1,14 +1,19 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
+import { computed, h, ref } from 'vue';
+import { ElMessage, ElMessageBox, ElNotification, type FormInstance, type FormRules } from 'element-plus';
 import FilterBar from '../components/common/FilterBar.vue';
 import EmptyPanel from '../components/common/EmptyPanel.vue';
 import DimensionChart from '../components/common/DimensionChart.vue';
 import { useBoardStore } from '../stores/boardStore';
 import { useChamberStore } from '../stores/chamberStore';
+import { useLacquerStore } from '../stores/lacquerStore';
+import { useStringingStore } from '../stores/stringingStore';
 import { useGuqinFilter } from '../hooks/useGuqinFilter';
 import { thicknessGap } from '../utils/wood';
 import { formatDate } from '../utils/layer';
+import { planRename, type RenamePlan } from '../utils/renameGuqin';
+import type { SoundChamber } from '../types/sound-chamber';
+import type { Stringing } from '../types/stringing';
 import {
   BOARD_PARTS,
   WOOD_DEFECTS,
@@ -23,12 +28,19 @@ import {
 
 const boardStore = useBoardStore();
 const chamberStore = useChamberStore();
+const lacquerStore = useLacquerStore();
+const stringingStore = useStringingStore();
 const filter = useGuqinFilter();
 
 const dialogVisible = ref(false);
 const editingId = ref('');
 const formRef = ref<FormInstance>();
 const selectedGuqin = ref('');
+
+const renameVisible = ref(false);
+const renameLoading = ref(false);
+const renameFrom = ref('');
+const renameTo = ref('');
 
 interface BoardForm {
   boardNo: string;
@@ -120,7 +132,12 @@ async function submit() {
     remark: form.value.remark,
   };
   if (editingId.value) {
-    await boardStore.updateBoard(editingId.value, payload);
+    try {
+      await boardStore.updateBoard(editingId.value, payload);
+    } catch (error) {
+      ElMessage.error((error as Error).message);
+      return;
+    }
     ElMessage.success(`已更新板材 ${payload.boardNo}`);
   } else {
     await boardStore.addBoard(payload);
@@ -137,12 +154,97 @@ async function remove(board: WoodBoard) {
   await boardStore.removeBoard(board.id);
   ElMessage.success('已删除');
 }
+
+/** 改琴号迁移预览：实时算出要搬哪些记录、哪条因新号已有而留下 */
+const renamePlan = computed<RenamePlan | null>(() => {
+  if (!renameVisible.value || !renameFrom.value) return null;
+  return planRename(
+    boardStore.boards,
+    chamberStore.chambers,
+    lacquerStore.layers,
+    stringingStore.stringings,
+    renameFrom.value,
+    renameTo.value.trim(),
+  );
+});
+
+const renameTargetExists = computed(() => boardStore.guqinNos.includes(renameTo.value.trim()));
+const renameInvalid = computed(
+  () => !renameTo.value.trim() || renameTo.value.trim() === renameFrom.value,
+);
+
+function openRename(guqinNo: string) {
+  renameFrom.value = guqinNo;
+  renameTo.value = '';
+  renameVisible.value = true;
+}
+
+function chamberDesc(c: SoundChamber): string {
+  return `槽腹深 ${c.chamberDepth}mm，纳音 ${c.nayinThickness}mm，掏膛人 ${c.carver}（${formatDate(c.carvedAt)}）`;
+}
+
+function stringingDesc(s: Stringing): string {
+  return `${s.stringType}，弦距 ${s.stringGap}mm，上弦人 ${s.operator}（${formatDate(s.strungAt)}）`;
+}
+
+async function confirmRename() {
+  const plan = renamePlan.value;
+  if (!plan || renameInvalid.value) return;
+  renameLoading.value = true;
+  try {
+    await boardStore.renameGuqin(plan.from, plan.to);
+    renameVisible.value = false;
+
+    const lines: string[] = [];
+    lines.push(`已把琴号 ${plan.from} 改为 ${plan.to}：板材 ${plan.movingBoards.length} 块（${plan.movingBoards
+      .map((b) => b.boardNo)
+      .join('、')}）随号迁移。`);
+    if (plan.movingLayers.length) {
+      lines.push(`髹漆 ${plan.movingLayers.length} 遍已并入新琴号，合并后共 ${plan.movingLayers.length + plan.targetLayers.length} 遍并按施工日期重排。`);
+    }
+    if (plan.movingChamber && !plan.keptChamber) {
+      lines.push(`槽腹记录已随号迁移。`);
+    }
+    if (plan.movingStringing && !plan.keptStringing) {
+      lines.push(`上弦记录已随号迁移。`);
+    }
+    if (plan.keptChamber) {
+      lines.push(
+        `槽腹：新琴号 ${plan.to} 已有记录（${chamberDesc(plan.keptChamber)}），已保留这份；旧琴号 ${plan.from} 的槽腹（${
+          plan.movingChamber ? chamberDesc(plan.movingChamber) : '无'
+        }）未搬、未覆盖，请人工核对后删除或保留。`,
+      );
+    }
+    if (plan.keptStringing) {
+      lines.push(
+        `上弦：新琴号 ${plan.to} 已有记录（${stringingDesc(plan.keptStringing)}），已保留这份；旧琴号 ${plan.from} 的上弦（${
+          plan.movingStringing ? stringingDesc(plan.movingStringing) : '无'
+        }）未搬、未覆盖，请人工核对后删除或保留。`,
+      );
+    }
+    if (plan.duplicateParts.length) {
+      lines.push(`注意：新琴号上${plan.duplicateParts.join('、')}已另有板材，迁移后出现重复部位，请到板材明细中挑板。`);
+    }
+
+    ElNotification({
+      title: plan.keptChamber || plan.keptStringing ? '改琴号完成（有记录被保留）' : '改琴号完成',
+      type: plan.keptChamber || plan.keptStringing ? 'warning' : 'success',
+      duration: 10000,
+      message: h('div', lines.map((line) => h('p', { style: 'margin: 4px 0;' }, line))),
+    });
+    selectedGuqin.value = plan.to;
+  } catch (error) {
+    ElMessage.error((error as Error).message);
+  } finally {
+    renameLoading.value = false;
+  }
+}
 </script>
 
 <template>
   <div>
     <h2 class="page-title">板材登记与配对</h2>
-    <p class="page-desc">同一琴号下面板与底板配对绑定，并按阴干年限回显含水率；三处厚度标注由槽腹记录派生。</p>
+    <p class="page-desc">同一琴号下面板与底板配对绑定，并按阴干年限回显含水率；三处厚度标注由槽腹记录派生。琴号敲错请用配对表中的「改琴号」，会把同号板材、槽腹、髹漆遍次与上弦一起迁到新琴号。</p>
 
     <div class="toolbar">
       <el-button type="primary" @click="openCreate">登记板材</el-button>
@@ -193,9 +295,10 @@ async function remove(board: WoodBoard) {
               <el-tag :type="scope.row.matched ? 'success' : 'warning'" size="small">{{ scope.row.matched ? '已配对' : '待配对' }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="110">
+          <el-table-column label="操作" width="168">
             <template #default="scope">
               <el-button link type="primary" @click="selectedGuqin = scope.row.guqinNo">剖面标注</el-button>
+              <el-button link type="warning" @click="openRename(scope.row.guqinNo)">改琴号</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -245,7 +348,13 @@ async function remove(board: WoodBoard) {
           <el-input v-model="form.boardNo" placeholder="如：MB-2511" maxlength="20" />
         </el-form-item>
         <el-form-item label="琴号" prop="guqinNo">
-          <el-input v-model="form.guqinNo" placeholder="如：Q-2506" maxlength="20" />
+          <el-input
+            v-model="form.guqinNo"
+            placeholder="如：Q-2506"
+            maxlength="20"
+            :disabled="Boolean(editingId)"
+          />
+          <div v-if="editingId" class="field-hint">琴号敲错请关闭本弹窗，到配对表点「改琴号」，槽腹、髹漆、上弦会随板材一起迁移</div>
         </el-form-item>
         <el-form-item label="部位">
           <el-select v-model="form.part" style="width: 160px">
@@ -285,6 +394,91 @@ async function remove(board: WoodBoard) {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="renameVisible" :title="`改琴号 · ${renameFrom}`" width="640px">
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="改琴号是一次跨工序迁移"
+        description="旧琴号下的全部板材、髹漆遍次、槽腹和上弦会一起搬到新琴号，避免进度页留下只有板材的空壳琴坯。"
+        style="margin-bottom: 12px"
+      />
+      <el-form label-width="96px">
+        <el-form-item label="旧琴号">
+          <el-input :model-value="renameFrom" disabled style="width: 200px" />
+        </el-form-item>
+        <el-form-item label="新琴号" required>
+          <el-input v-model="renameTo" placeholder="如：Q-2511" maxlength="20" style="width: 200px" clearable />
+        </el-form-item>
+      </el-form>
+
+      <template v-if="renamePlan">
+        <el-divider content-position="left">迁移内容预览</el-divider>
+        <ul class="rename-preview">
+          <li>
+            板材 <b>{{ renamePlan.movingBoards.length }}</b> 块一起迁移：
+            <span v-for="board in renamePlan.movingBoards" :key="board.id" class="preview-chip">
+              {{ board.part }} {{ board.boardNo }}
+            </span>
+            <el-tag
+              v-for="part in renamePlan.duplicateParts"
+              :key="part"
+              type="warning"
+              size="small"
+              style="margin-left: 6px"
+            >
+              新号已有{{ part }}，迁移后重复需挑板
+            </el-tag>
+          </li>
+          <li>
+            髹漆 <b>{{ renamePlan.movingLayers.length }}</b> 遍一起迁移；
+            <template v-if="renamePlan.targetLayers.length">
+              新琴号原有 <b>{{ renamePlan.targetLayers.length }}</b> 遍，合并后按施工日期重排遍次、重算累计厚度（两边都不覆盖）。
+            </template>
+            <template v-else>新琴号尚无髹漆遍次。</template>
+          </li>
+          <li>
+            槽腹：
+            <template v-if="!renamePlan.movingChamber">旧琴号无槽腹记录，不涉及。</template>
+            <template v-else-if="!renamePlan.keptChamber">旧琴号的槽腹记录随号迁移。</template>
+            <template v-else>
+              <el-tag type="warning" size="small">保留新号原件，不搬不盖</el-tag>
+              <div class="preview-keep">
+                新琴号 {{ renameTo }} 已有：{{ chamberDesc(renamePlan.keptChamber) }}
+              </div>
+              <div class="preview-keep">
+                旧琴号 {{ renameFrom }} 这份将留下：{{ chamberDesc(renamePlan.movingChamber) }}
+              </div>
+            </template>
+          </li>
+          <li>
+            上弦：
+            <template v-if="!renamePlan.movingStringing">旧琴号无上弦记录，不涉及。</template>
+            <template v-else-if="!renamePlan.keptStringing">旧琴号的上弦记录随号迁移。</template>
+            <template v-else>
+              <el-tag type="warning" size="small">保留新号原件，不搬不盖</el-tag>
+              <div class="preview-keep">
+                新琴号 {{ renameTo }} 已有：{{ stringingDesc(renamePlan.keptStringing) }}
+              </div>
+              <div class="preview-keep">
+                旧琴号 {{ renameFrom }} 这份将留下：{{ stringingDesc(renamePlan.movingStringing) }}
+              </div>
+            </template>
+          </li>
+          <li v-if="renameTargetExists" class="rename-merge-note">
+            新琴号 {{ renameTo }} 是已存在的琴号，本次为合并迁移，不会覆盖其已录的掏膛和上弦数据。
+          </li>
+        </ul>
+      </template>
+
+      <template #footer>
+        <el-button @click="renameVisible = false">取消</el-button>
+        <el-button type="primary" :loading="renameLoading" :disabled="renameInvalid" @click="confirmRename">
+          确认迁移
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -310,5 +504,36 @@ async function remove(board: WoodBoard) {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+.field-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #b8860b;
+}
+.rename-preview {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.8;
+  color: #5c4a38;
+}
+.rename-preview li {
+  margin-bottom: 6px;
+}
+.preview-chip {
+  display: inline-block;
+  margin: 0 4px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: #f3ead9;
+}
+.preview-keep {
+  margin-top: 2px;
+  padding-left: 6px;
+  color: #8a6d3b;
+}
+.rename-merge-note {
+  color: #b8860b;
 }
 </style>
