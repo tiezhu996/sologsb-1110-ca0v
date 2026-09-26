@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus';
+import { computed, h, ref } from 'vue';
+import { ElMessage, ElMessageBox, ElNotification, type FormInstance, type FormRules } from 'element-plus';
 import FilterBar from '../components/common/FilterBar.vue';
 import EmptyPanel from '../components/common/EmptyPanel.vue';
 import DimensionChart from '../components/common/DimensionChart.vue';
-import { useBoardStore } from '../stores/boardStore';
+import { useBoardStore, type GuqinMigrationReport } from '../stores/boardStore';
 import { useChamberStore } from '../stores/chamberStore';
+import { useLacquerStore } from '../stores/lacquerStore';
+import { useStringingStore } from '../stores/stringingStore';
 import { useGuqinFilter } from '../hooks/useGuqinFilter';
 import { thicknessGap } from '../utils/wood';
 import { formatDate } from '../utils/layer';
+import type { SoundChamber } from '../types/sound-chamber';
+import type { Stringing } from '../types/stringing';
 import {
   BOARD_PARTS,
   WOOD_DEFECTS,
@@ -23,6 +27,8 @@ import {
 
 const boardStore = useBoardStore();
 const chamberStore = useChamberStore();
+const lacquerStore = useLacquerStore();
+const stringingStore = useStringingStore();
 const filter = useGuqinFilter();
 
 const dialogVisible = ref(false);
@@ -104,6 +110,106 @@ function openEdit(board: WoodBoard) {
   dialogVisible.value = true;
 }
 
+/**
+ * 改琴号是一次跨工序迁移：先让档案员看清迁移范围与冲突保留项，确认后才执行。
+ * 新号已有槽腹/上弦时，保留新号原有那份，旧号那份不覆盖。
+ */
+async function confirmMigration(from: string, to: string): Promise<boolean> {
+  const boardNos = boardStore.boardsOf(from).map((b) => b.boardNo);
+  const fromChamber = chamberStore.byGuqin(from);
+  const toChamber = chamberStore.byGuqin(to);
+  const fromStringings = stringingStore.stringings.filter((s) => s.guqinNo === from);
+  const toStringings = stringingStore.stringings.filter((s) => s.guqinNo === to);
+  const movedLayerCount = lacquerStore.layersOf(from).length;
+  const keptLayerCount = lacquerStore.layersOf(to).length;
+
+  const lines: string[] = [];
+  lines.push(`· 板材 ${boardNos.length} 块：${boardNos.join('、') || '—'}`);
+  lines.push(`· 髹漆遍次 ${movedLayerCount} 遍${keptLayerCount ? `，与新号已有的 ${keptLayerCount} 遍合并续编` : ''}`);
+
+  if (fromChamber) {
+    lines.push(
+      toChamber
+        ? `· 槽腹：新号 ${to} 已有一份（掏膛 ${formatDate(toChamber.carvedAt)}，深 ${toChamber.chamberDepth}mm），保留新号这份；旧号 ${from} 的槽腹（深 ${fromChamber.chamberDepth}mm）留在原处不搬`
+        : '· 槽腹 1 份：随琴号搬走',
+    );
+  }
+  if (fromStringings.length) {
+    lines.push(
+      toStringings.length
+        ? `· 上弦：新号 ${to} 已有上弦记录（${toStringings[0].stringType}，${formatDate(toStringings[0].strungAt)}），保留新号这份；旧号 ${from} 的上弦留在原处不搬`
+        : `· 上弦 ${fromStringings.length} 条：随琴号搬走`,
+    );
+  }
+
+  const message = h('div', { class: 'migrate-confirm' }, [
+    h('div', { style: 'margin-bottom: 6px' }, `琴号 ${from} → ${to}，同琴号下的工序档案将一并迁移：`),
+    ...lines.map((line) => h('div', { style: 'line-height: 1.9' }, line)),
+    h(
+      'div',
+      { style: 'margin-top: 8px; color: #b88230' },
+      '被留下的记录不会删除或覆盖，仍可在旧琴号下查到，需要时请到对应工序页另行处理。',
+    ),
+  ]);
+
+  return ElMessageBox.confirm(message, '跨工序迁移确认', {
+    type: 'warning',
+    confirmButtonText: '执行迁移',
+    cancelButtonText: '取消',
+    dangerouslyUseHTMLString: false,
+  })
+    .then(() => true)
+    .catch(() => false);
+}
+
+function chamberLine(label: string, chamber: SoundChamber): string {
+  return `${label}（掏膛 ${formatDate(chamber.carvedAt)}，槽腹深 ${chamber.chamberDepth}mm，${chamber.carver}）`;
+}
+
+function stringingLine(label: string, stringing: Stringing): string {
+  return `${label}（${stringing.stringType}，${formatDate(stringing.strungAt)} 上弦，${stringing.operator}）`;
+}
+
+/** 迁移完成后把搬走与留下的内容逐条说清，避免误覆盖已录好的掏膛与上弦 */
+function notifyMigration(report: GuqinMigrationReport) {
+  const conflicts: string[] = [];
+  if (report.chamber.kept) {
+    conflicts.push(`新号 ${report.to} 的${chamberLine('槽腹记录被保留', report.chamber.kept)}；旧号 ${report.from} 的槽腹未搬入、未覆盖。`);
+  }
+  report.stringings.forEach((item) => {
+    if (item.kept) {
+      conflicts.push(`新号 ${report.to} 的${stringingLine('上弦记录被保留', item.kept)}；旧号 ${report.from} 的上弦未搬入、未覆盖。`);
+    }
+  });
+
+  const moved: string[] = [
+    `板材 ${report.boardNos.length} 块（${report.boardNos.join('、') || '—'}）`,
+    `髹漆遍次 ${report.movedLayerIds.length} 遍`,
+  ];
+  if (report.chamber.moved) moved.push(chamberLine('槽腹 1 份', report.chamber.moved));
+  const movedStringings = report.stringings.filter((item) => item.moved);
+  if (movedStringings.length) moved.push(stringingLine(`上弦 ${movedStringings.length} 条`, movedStringings[0].moved!));
+
+  if (conflicts.length) {
+    ElNotification({
+      title: `已迁移到 ${report.to}（有记录被保留）`,
+      type: 'warning',
+      duration: 8000,
+      message: h('div', [
+        h('div', { style: 'margin-bottom: 4px' }, `已搬走：${moved.join('、')}。`),
+        ...conflicts.map((line) => h('div', { style: 'line-height: 1.8' }, `· ${line}`)),
+      ]),
+    });
+  } else {
+    ElNotification({
+      title: `已迁移到 ${report.to}`,
+      type: 'success',
+      duration: 6000,
+      message: `已搬走：${moved.join('、')}。`,
+    });
+  }
+}
+
 async function submit() {
   const ok = await formRef.value?.validate().catch(() => false);
   if (!ok) return;
@@ -120,8 +226,18 @@ async function submit() {
     remark: form.value.remark,
   };
   if (editingId.value) {
-    await boardStore.updateBoard(editingId.value, payload);
-    ElMessage.success(`已更新板材 ${payload.boardNo}`);
+    const current = boardStore.boards.find((b) => b.id === editingId.value);
+    if (current && payload.guqinNo.trim() && payload.guqinNo.trim() !== current.guqinNo) {
+      const confirmed = await confirmMigration(current.guqinNo, payload.guqinNo.trim());
+      if (!confirmed) return;
+      // 迁移已把旧号下全部板材（含当前板材）改到新号，再回填本表单其余字段
+      const report = await boardStore.migrateGuqinNo(current.guqinNo, payload.guqinNo.trim());
+      await boardStore.updateBoard(editingId.value, payload);
+      notifyMigration(report);
+    } else {
+      await boardStore.updateBoard(editingId.value, payload);
+      ElMessage.success(`已更新板材 ${payload.boardNo}`);
+    }
   } else {
     await boardStore.addBoard(payload);
     ElMessage.success(`已登记板材 ${payload.boardNo}（${payload.part}）`);
@@ -246,6 +362,9 @@ async function remove(board: WoodBoard) {
         </el-form-item>
         <el-form-item label="琴号" prop="guqinNo">
           <el-input v-model="form.guqinNo" placeholder="如：Q-2506" maxlength="20" />
+          <div v-if="editingId" class="guqin-hint">
+            改动琴号会把同琴号下的其它板材、髹漆遍次、槽腹与上弦一起迁到新琴号；新琴号已有槽腹或上弦时保留其原有记录，不会覆盖。
+          </div>
         </el-form-item>
         <el-form-item label="部位">
           <el-select v-model="form.part" style="width: 160px">
@@ -310,5 +429,11 @@ async function remove(board: WoodBoard) {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+.guqin-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #b88230;
 }
 </style>
